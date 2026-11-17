@@ -39,6 +39,7 @@ inline int clampServoDeg(int axis, int deg) {
 static const float SERVO_SPEED_DEG_S = 50.0f;  // legacy default (= level 5)
 static const uint32_t SERVO_TICK_MS = 10;
 static const uint32_t SERVO_LOG_MS = 200;
+static const uint32_t SERVO_HOLD_MS = 200;  // refresh PWM while idle (prevent limp)
 
 // Runtime tour/jog speed level 1..9 (default 5)
 static const int SPEED_LEVEL_MAX = 9;
@@ -108,7 +109,13 @@ class ServoAxis {
   void setDirection(int dir) {
     if (dir < -1) dir = -1;
     if (dir > 1) dir = 1;
+    // Do not keep driving into a soft stop (avoids limit log spam).
+    int minUs = degToUs(_minDeg);
+    int maxUs = degToUs(_maxDeg);
+    if (dir < 0 && _us <= minUs) dir = 0;
+    if (dir > 0 && _us >= maxUs) dir = 0;
     if (dir != 0) _targetUs = -1;  // jog cancels goto
+    if (dir != _dir) _limitLogged = false;
     _dir = dir;
   }
 
@@ -127,6 +134,25 @@ class ServoAxis {
     _targetUs = -1;
     _dir = 0;
     _servo.writeMicroseconds(_us);
+  }
+
+  // Ensure PWM is attached and holding (no detach — detach drops torque).
+  void reassert() {
+    _dir = 0;
+    _targetUs = -1;
+    _limitLogged = false;
+    if (!_servo.attached()) {
+      int ch = _servo.attach(_pin, SERVO_US_MIN, SERVO_US_MAX);
+      (void)ch;
+      if (!_servo.attached()) {
+        Serial.printf("[SERVO] %s gpio=%d REATTACH FAIL\n", _label, _pin);
+        return;
+      }
+    }
+    _servo.writeMicroseconds(_us);
+    _lastHoldMs = millis();
+    Serial.printf("[SERVO] %s gpio=%d reassert deg=%d us=%d\n",
+                  _label, _pin, angle(), _us);
   }
 
   bool busy() const { return _dir != 0 || _targetUs >= 0; }
@@ -162,19 +188,40 @@ class ServoAxis {
       }
     } else if (_dir != 0) {
       next = _us + _dir * deltaUs;
-      if (next < minUs) next = minUs;
-      if (next > maxUs) next = maxUs;
-      if (next == _us && (now - _lastLogMs >= SERVO_LOG_MS)) {
-        _lastLogMs = now;
-        Serial.printf("[SERVO] %s gpio=%d deg=%d (limit)\n", _label, _pin, angle());
+      bool hitLimit = false;
+      if (next <= minUs) {
+        next = minUs;
+        hitLimit = (_dir < 0);
+      } else if (next >= maxUs) {
+        next = maxUs;
+        hitLimit = (_dir > 0);
+      }
+      if (hitLimit) {
+        _dir = 0;
+        // Always reaffirm PWM at the stop so holding torque stays on.
+        _us = next;
+        _servo.writeMicroseconds(_us);
+        _lastHoldMs = now;
+        if (!_limitLogged) {
+          _limitLogged = true;
+          _lastLogMs = now;
+          Serial.printf("[SERVO] %s gpio=%d deg=%d (limit)\n", _label, _pin, usToDeg(next));
+        }
+        return;
       }
     } else {
+      // Idle: periodically rewrite the same pulse so LEDC keep-alive holds torque.
+      if (_servo.attached() && (now - _lastHoldMs >= SERVO_HOLD_MS)) {
+        _lastHoldMs = now;
+        _servo.writeMicroseconds(_us);
+      }
       return;
     }
 
     if (next != _us) {
       _us = next;
       _servo.writeMicroseconds(_us);
+      _lastHoldMs = now;
       if (now - _lastLogMs >= SERVO_LOG_MS) {
         _lastLogMs = now;
         logAngle();
@@ -188,10 +235,13 @@ class ServoAxis {
 
  private:
   static int degToUs(int deg) {
-    return map(deg, 0, 180, SERVO_US_MIN, SERVO_US_MAX);
+    long num = (long)deg * (SERVO_US_MAX - SERVO_US_MIN);
+    return SERVO_US_MIN + (int)((num + 90) / 180);
   }
   static int usToDeg(int us) {
-    return map(us, SERVO_US_MIN, SERVO_US_MAX, 0, 180);
+    long num = (long)(us - SERVO_US_MIN) * 180L;
+    long den = (long)(SERVO_US_MAX - SERVO_US_MIN);
+    return (int)((num + den / 2) / den);
   }
 
   Servo _servo;
@@ -202,8 +252,10 @@ class ServoAxis {
   int _us = 0;
   int _dir = 0;
   int _targetUs = -1;
+  bool _limitLogged = false;
   uint32_t _lastTickMs = 0;
   uint32_t _lastLogMs = 0;
+  uint32_t _lastHoldMs = 0;
 };
 
 class ServoBank {
@@ -280,6 +332,22 @@ class ServoBank {
     _axes[0].snapToTarget();
 #else
     for (int i = 0; i < 4; i++) {
+      _axes[i].setTargetDeg(deg[i]);
+      _axes[i].snapToTarget();
+    }
+#endif
+  }
+
+  // Hard recovery: stop motion, re-attach PWM, snap to pose immediately.
+  void reinitToAngles(const int deg[4]) {
+    stopAll();
+#ifdef SERVO_SINGLE_PIN
+    _axes[0].reassert();
+    _axes[0].setTargetDeg(deg[0]);
+    _axes[0].snapToTarget();
+#else
+    for (int i = 0; i < 4; i++) {
+      _axes[i].reassert();
       _axes[i].setTargetDeg(deg[i]);
       _axes[i].snapToTarget();
     }

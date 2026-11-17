@@ -103,14 +103,14 @@ class Csg4s {
     writeDigits(segs[3], segs[2], segs[1], segs[0]);
   }
 
-  // F{slot}{speed}{mode}  e.g. F351 = slot3 speed5 play; slot10 shows as '0'
+  // {slot}F{speed}{mode}  e.g. 3F51 = slot3 speed5 play; slot10 shows as '0'
   // mode: 0=idle 1=play 2=pause
   void showStatus(int slot1to10, int speed1to9, int mode) {
     char buf[5];
-    buf[0] = 'F';
-    if (slot1to10 >= 1 && slot1to10 <= 9) buf[1] = (char)('0' + slot1to10);
-    else if (slot1to10 == 10) buf[1] = '0';
-    else buf[1] = '-';
+    if (slot1to10 >= 1 && slot1to10 <= 9) buf[0] = (char)('0' + slot1to10);
+    else if (slot1to10 == 10) buf[0] = '0';
+    else buf[0] = '-';
+    buf[1] = 'F';
     buf[2] = (speed1to9 >= 1 && speed1to9 <= 9) ? (char)('0' + speed1to9) : '-';
     buf[3] = (mode == 1) ? '1' : (mode == 2) ? '2' : '0';
     buf[4] = 0;

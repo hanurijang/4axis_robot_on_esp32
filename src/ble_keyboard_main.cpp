@@ -71,7 +71,7 @@ static const uint32_t TOUR_DWELL_MS = 500;
 
 static void refreshDisplay() {
   if (!gCsg.ok()) return;
-  // F{slot}{speed}{mode}  e.g. F351 = slot3, speed5, play
+  // {slot}F{speed}{mode}  e.g. 3F51 = slot3, speed5, play
   int mode = (gTour == TOUR_PLAY) ? 1 : (gTour == TOUR_PAUSE) ? 2 : 0;
   gCsg.showStatus(gTourSlot, getSpeedLevel(), mode);
 }
@@ -161,6 +161,21 @@ static void gotoHome() {
                 deg[0], deg[1], deg[2], deg[3]);
 }
 
+// ESC: hard init — stop tour/jog, re-attach PWM, snap to HOME (recovery).
+static void hardInit() {
+  tourStop("esc init");
+  gHeldAxes = 0;
+  int deg[4];
+  gMem.getHome(deg);
+  gServos.reinitToAngles(deg);
+  // Second write reinforces hold without blocking BLE (boot uses delay; here avoid it).
+  gServos.setAnglesImmediate(deg);
+  gTourSlot = 0;
+  refreshDisplay();
+  Serial.printf("[INIT] ESC hard HOME %d,%d,%d,%d (PWM reassert)\n",
+                deg[0], deg[1], deg[2], deg[3]);
+}
+
 static void handlePoseKeys(const HidBootKeyboardReport& report) {
   const bool tourActive = (gTour == TOUR_PLAY || gTour == TOUR_PAUSE);
 
@@ -168,6 +183,12 @@ static void handlePoseKeys(const HidBootKeyboardReport& report) {
     uint8_t u = report.keys[i];
     if (u == 0) continue;
     if (keyInList(u, gPrevKbKeys)) continue;
+
+    // ESC works anytime (recovery from limp / stuck limit / tour).
+    if (u == 0x29) {
+      hardInit();
+      continue;
+    }
 
     // Tour: only speed keys (= faster / - slower). Ignore F-save, recall, etc.
     if (tourActive) {
@@ -400,12 +421,32 @@ class ClientCallbacks : public NimBLEClientCallbacks {
   }
 };
 
+static uint16_t gLastHidHandle = 0xFFFF;
+static size_t gLastHidLen = 0;
+static uint8_t gLastHidData[16];
+
+static bool isDuplicateHidPayload(uint16_t handle, const uint8_t* data, size_t len) {
+  if (len == 0 || len > sizeof(gLastHidData)) return false;
+  if (handle == gLastHidHandle && len == gLastHidLen &&
+      memcmp(data, gLastHidData, len) == 0) {
+    return true;
+  }
+  gLastHidHandle = handle;
+  gLastHidLen = len;
+  memcpy(gLastHidData, data, len);
+  return false;
+}
+
 static void handleHidPayload(const char* tag, NimBLERemoteCharacteristic* chr,
                              uint8_t* data, size_t len) {
+  const uint16_t handle = chr ? chr->getHandle() : 0;
+  // Identical consecutive reports (notify spam / POLL reread) — skip log + reapply.
+  if (isDuplicateHidPayload(handle, data, len)) return;
+
   Serial.printf("[%s] uuid=%s handle=%u len=%u hex=",
                 tag,
                 chr ? chr->getUUID().toString().c_str() : "?",
-                chr ? chr->getHandle() : 0,
+                handle,
                 (unsigned)len);
   for (size_t i = 0; i < len; i++) Serial.printf("%02X", data[i]);
   Serial.println();
@@ -707,7 +748,7 @@ void setup() {
   Serial.println("========================================");
   Serial.println("1) Put BLE keyboard in pairing mode");
   Serial.println("2) Wait for [SCAN] / connect");
-  Serial.println("3) F1-F10 save | 0-9 recall | 0x223=HOME | 0x221=clear | 0xCD=tour | 0x196=stop");
+  Serial.println("3) ESC=hard init | F1-F10 save | 0-9 recall | 0x223=HOME | 0x221=clear | 0xCD=tour | 0x196=stop");
   Serial.println("========================================");
 #ifdef SERVO_SINGLE_PIN
   Serial.printf("SINGLE TEST: signal->GPIO%d | ext VCC + common GND\n", SERVO_SINGLE_PIN);
