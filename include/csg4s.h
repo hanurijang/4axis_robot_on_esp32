@@ -99,12 +99,22 @@ class Csg4s {
       char c = (s4 && s4[i]) ? s4[i] : ' ';
       segs[i] = charToSeg(c);
     }
-    // SAA1064 write order starts at digit1 = rightmost
+    // Digit order flipped vs prior wiring assumption (left↔right swap).
+    writeDigits(segs[0], segs[1], segs[2], segs[3]);
+  }
+
+  // Status-page digit order (opposite of showAscii4 / A–D pages).
+  void showStatusAscii4(const char* s4) {
+    uint8_t segs[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4; i++) {
+      char c = (s4 && s4[i]) ? s4[i] : ' ';
+      segs[i] = charToSeg(c);
+    }
     writeDigits(segs[3], segs[2], segs[1], segs[0]);
   }
 
-  // {slot}F{speed}{mode}  e.g. 3F51 = slot3 speed5 play; slot10 shows as '0'
-  // mode: 0=idle 1=play 2=pause
+  // Logical {slot}F{speed}{mode}; physical L→R after this write = same.
+  // mode: 0=idle 1=play 2=pause; slot10 shows as '0'
   void showStatus(int slot1to10, int speed1to9, int mode) {
     char buf[5];
     if (slot1to10 >= 1 && slot1to10 <= 9) buf[0] = (char)('0' + slot1to10);
@@ -113,6 +123,22 @@ class Csg4s {
     buf[1] = 'F';
     buf[2] = (speed1to9 >= 1 && speed1to9 <= 9) ? (char)('0' + speed1to9) : '-';
     buf[3] = (mode == 1) ? '1' : (mode == 2) ? '2' : '0';
+    buf[4] = 0;
+    showStatusAscii4(buf);
+  }
+
+  // BLE disconnected hint (opposite digit order vs status page)
+  void showBleLost() { showAscii4("LOSt"); }
+
+  // Axis angle page: A090 / B123 / C050 / D063 (A=ax1 .. D=ax4)
+  void showAxisDeg(char axisLetter, int deg) {
+    if (deg < 0) deg = 0;
+    if (deg > 999) deg = 999;
+    char buf[5];
+    buf[0] = axisLetter;
+    buf[1] = (char)('0' + (deg / 100) % 10);
+    buf[2] = (char)('0' + (deg / 10) % 10);
+    buf[3] = (char)('0' + deg % 10);
     buf[4] = 0;
     showAscii4(buf);
   }
@@ -148,6 +174,11 @@ class Csg4s {
     if (c >= 'A' && c <= 'F') return CSG_SEG_DIGIT[10 + (c - 'A')];
     if (c >= 'a' && c <= 'f') return CSG_SEG_DIGIT[10 + (c - 'a')];
     if (c == '-') return 0x40;  // G
+    // Extra letters for short status words (LOSt, etc.)
+    if (c == 'L') return 0x38;  // E+F+D
+    if (c == 'O') return 0x3F;  // same as 0
+    if (c == 'S') return 0x6D;  // same as 5
+    if (c == 't') return 0x78;  // A+E+F+G approx
     return 0x00;               // blank
   }
 

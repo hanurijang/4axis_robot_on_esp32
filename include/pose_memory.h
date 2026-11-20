@@ -6,9 +6,9 @@
 
 static const int POSE_SLOTS = 10;
 
-// Fixed home (not user-configurable)
+// Fixed home (not user-configurable): ax1..ax3=90, ax4(D)=85
 static const int HOME_DEG[4] = {
-    SERVO_CENTER_DEG, SERVO_CENTER_DEG, SERVO_CENTER_DEG, SERVO_CENTER_DEG};
+    SERVO_CENTER_DEG, SERVO_CENTER_DEG, SERVO_CENTER_DEG, 85};
 
 struct PoseSlot {
   bool valid = false;
@@ -86,6 +86,22 @@ class PoseMemory {
 
   void getHome(int outDeg[4]) const {
     for (int i = 0; i < 4; i++) outDeg[i] = HOME_DEG[i];
+  }
+
+  // Last commanded pose (for gentle boot: restore PWM here, then slew to HOME)
+  bool loadLast(int outDeg[4]) {
+    PoseSlot slot;
+    size_t n = _prefs.getBytes("last", &slot, sizeof(slot));
+    if (n != sizeof(slot) || !slot.valid) return false;
+    for (int i = 0; i < 4; i++) outDeg[i] = clampServoDeg(i, slot.deg[i]);
+    return true;
+  }
+
+  void saveLast(const int deg[4]) {
+    PoseSlot slot;
+    slot.valid = true;
+    for (int i = 0; i < 4; i++) slot.deg[i] = clampServoDeg(i, deg[i]);
+    _prefs.putBytes("last", &slot, sizeof(slot));
   }
 
   void clearAll() {

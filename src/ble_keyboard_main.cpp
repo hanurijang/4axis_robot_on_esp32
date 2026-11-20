@@ -42,6 +42,10 @@ static uint32_t gLastScanMs = 0;
 static uint32_t gLastHeartbeatMs = 0;
 static NimBLERemoteCharacteristic* gBootKb = nullptr;
 static std::vector<NimBLERemoteCharacteristic*> gInputReports;
+// Only these HID Input reports may drive servos (others cause phantom jog).
+static uint16_t gKbReportHandle = 0;        // Report Ref id=1 (keyboard)
+static uint16_t gConsumerReportHandle = 0;  // Report Ref id=2 (consumer)
+static const bool HID_VERBOSE = true;       // show raw key/consumer reports on serial
 static int gBestScanScore = -10000;
 static NimBLEAddress gLastAddr;
 static bool gHaveLastAddr = false;
@@ -62,18 +66,61 @@ static PoseMemory gMem;
 static Csg4s gCsg;
 static uint8_t gPrevKbKeys[6] = {0};
 static uint16_t gPrevConsumer = 0;
+static uint32_t gLastConsumerEdgeMs = 0;
+static const uint32_t CONSUMER_DEBOUNCE_MS = 60;  // ignore chatter on media keys
 
 enum TourState : uint8_t { TOUR_IDLE = 0, TOUR_PLAY, TOUR_PAUSE };
 static TourState gTour = TOUR_IDLE;
 static int gTourSlot = 0;  // last/current slot 1..9
 static uint32_t gTourArriveMs = 0;
-static const uint32_t TOUR_DWELL_MS = 500;
+static const uint32_t TOUR_DWELL_MS = 350;  // pause after all axes idle before next slot
+// Tour PLAY: suppress BLE reconnect except a short window at F1 arrival.
+static const uint32_t TOUR_F1_BLE_WINDOW_MS = 2000;
+static const uint32_t TOUR_F1_CONNECT_TIMEOUT_S = 2;  // fail fast inside F1 window
+static uint32_t gTourBleUntilMs = 0;  // millis deadline; 0 = no window
+
+static bool tourPlayBleWindowOpen() {
+  if (gTour != TOUR_PLAY) return false;
+  if (gTourBleUntilMs == 0) return false;
+  return (int32_t)(millis() - gTourBleUntilMs) < 0;
+}
+
+// During PLAY, only reconnect inside the F1 window. IDLE/PAUSE: always allowed.
+static bool bleReconnectAllowedNow() {
+  if (gTour != TOUR_PLAY) return true;
+  return tourPlayBleWindowOpen();
+}
+
+// SPACE cycles display: status -> A(ax1) -> B -> C -> D -> status...
+enum DispPage : uint8_t {
+  DISP_STATUS = 0,
+  DISP_AX1,
+  DISP_AX2,
+  DISP_AX3,
+  DISP_AX4,
+  DISP_PAGE_COUNT
+};
+static DispPage gDispPage = DISP_STATUS;
+static uint32_t gLastDispMs = 0;
+static const uint32_t DISP_ANGLE_REFRESH_MS = 100;
 
 static void refreshDisplay() {
   if (!gCsg.ok()) return;
-  // {slot}F{speed}{mode}  e.g. 3F51 = slot3, speed5, play
-  int mode = (gTour == TOUR_PLAY) ? 1 : (gTour == TOUR_PAUSE) ? 2 : 0;
-  gCsg.showStatus(gTourSlot, getSpeedLevel(), mode);
+  if (gDispPage == DISP_STATUS) {
+    // Disconnected: blink LOSt <-> normal status so tour info is not lost.
+    if (!gConnected && ((millis() / 500) & 1)) {
+      gCsg.showBleLost();
+      return;
+    }
+    int mode = (gTour == TOUR_PLAY) ? 1 : (gTour == TOUR_PAUSE) ? 2 : 0;
+    gCsg.showStatus(gTourSlot, getSpeedLevel(), mode);
+    return;
+  }
+  int deg[4];
+  gServos.getAngles(deg);
+  const int idx = (int)gDispPage - 1;  // 0..3
+  static const char letters[4] = {'A', 'B', 'C', 'D'};
+  gCsg.showAxisDeg(letters[idx], deg[idx]);
 }
 
 static bool keyInList(uint8_t usage, const uint8_t keys[6]) {
@@ -85,6 +132,7 @@ static bool keyInList(uint8_t usage, const uint8_t keys[6]) {
 static void tourStop(const char* why) {
   gTour = TOUR_IDLE;
   gTourArriveMs = 0;
+  gTourBleUntilMs = 0;
   Serial.printf("[TOUR] stop (%s)\n", why);
   refreshDisplay();
 }
@@ -145,9 +193,27 @@ static void serviceTour() {
     gTourArriveMs = 0;
     return;
   }
-  if (gTourArriveMs == 0) gTourArriveMs = millis();
-  if (millis() - gTourArriveMs < TOUR_DWELL_MS) return;
+  if (gTourArriveMs == 0) {
+    gTourArriveMs = millis();
+    // Each lap at F1: brief BLE reconnect window (keyboard may be asleep).
+    if (gTourSlot == 1 && !gConnected) {
+      gTourBleUntilMs = millis() + TOUR_F1_BLE_WINDOW_MS;
+      seedPreferredAddr();
+      gNeedReconnect = true;
+      gReconnectAttempt = 0;
+      gReconnectAtMs = millis();  // try immediately inside window
+      Serial.printf("[TOUR] F1 BLE window %lums\n",
+                    (unsigned long)TOUR_F1_BLE_WINDOW_MS);
+    }
+  }
+  // Stay at F1 for the BLE window when disconnected; else normal dwell.
+  uint32_t dwell = TOUR_DWELL_MS;
+  if (gTourSlot == 1 && !gConnected && tourPlayBleWindowOpen()) {
+    dwell = TOUR_F1_BLE_WINDOW_MS;
+  }
+  if (millis() - gTourArriveMs < dwell) return;
   gTourArriveMs = 0;
+  if (gTourSlot == 1) gTourBleUntilMs = 0;  // close window before leaving F1
   tourAdvance();
 }
 
@@ -161,18 +227,16 @@ static void gotoHome() {
                 deg[0], deg[1], deg[2], deg[3]);
 }
 
-// ESC: hard init — stop tour/jog, re-attach PWM, snap to HOME (recovery).
+// ESC: hard init — stop tour/jog, reassert PWM, slew smoothly to HOME.
 static void hardInit() {
   tourStop("esc init");
   gHeldAxes = 0;
   int deg[4];
   gMem.getHome(deg);
-  gServos.reinitToAngles(deg);
-  // Second write reinforces hold without blocking BLE (boot uses delay; here avoid it).
-  gServos.setAnglesImmediate(deg);
+  gServos.reinitToAngles(deg);  // reassert hold, then goto (no snap jerk)
   gTourSlot = 0;
   refreshDisplay();
-  Serial.printf("[INIT] ESC hard HOME %d,%d,%d,%d (PWM reassert)\n",
+  Serial.printf("[INIT] ESC soft HOME %d,%d,%d,%d (PWM reassert + slew)\n",
                 deg[0], deg[1], deg[2], deg[3]);
 }
 
@@ -190,18 +254,29 @@ static void handlePoseKeys(const HidBootKeyboardReport& report) {
       continue;
     }
 
-    // Tour: only speed keys (= faster / - slower). Ignore F-save, recall, etc.
-    if (tourActive) {
-      if (u == 0x2E || u == 0x2D) {
-        int delta = (u == 0x2E) ? +1 : -1;
-        if (bumpSpeedLevel(delta)) {
-          Serial.printf("[TOUR] speed level=%d (%.0f deg/s)\n",
-                        getSpeedLevel(), (double)getServoSpeedDegS());
-        } else {
-          Serial.printf("[TOUR] speed level=%d (limit)\n", getSpeedLevel());
-        }
-        refreshDisplay();
+    // SPACE: cycle display page (status / A / B / C / D) anytime.
+    if (u == 0x2C) {
+      gDispPage = (DispPage)((gDispPage + 1) % DISP_PAGE_COUNT);
+      Serial.printf("[DISP] page=%u\n", (unsigned)gDispPage);
+      refreshDisplay();
+      continue;
+    }
+
+    // Speed (= faster / - slower): IDLE + tour. Applies to jog and goto/tour.
+    if (u == 0x2E || u == 0x2D) {
+      int delta = (u == 0x2E) ? +1 : -1;
+      if (bumpSpeedLevel(delta)) {
+        Serial.printf("[SPEED] level=%d (%.0f deg/s)\n",
+                      getSpeedLevel(), (double)getServoSpeedDegS());
+      } else {
+        Serial.printf("[SPEED] level=%d (limit)\n", getSpeedLevel());
       }
+      refreshDisplay();
+      continue;
+    }
+
+    // Tour: ignore F-save / recall / other keys while PLAY/PAUSE
+    if (tourActive) {
       continue;
     }
 
@@ -231,6 +306,15 @@ static void handlePoseKeys(const HidBootKeyboardReport& report) {
 
 static void handleConsumerEdge(uint16_t usage) {
   const bool tourActive = (gTour == TOUR_PLAY || gTour == TOUR_PAUSE);
+  const uint32_t now = millis();
+  // Release always accepted (clear held). Presses debounced against chatter.
+  if (usage != 0 && usage == gPrevConsumer) return;
+  if (usage != 0 && (now - gLastConsumerEdgeMs) < CONSUMER_DEBOUNCE_MS &&
+      usage != HID_CONSUMER_PLAY_PAUSE && usage != HID_CONSUMER_TOUR_STOP &&
+      usage != HID_CONSUMER_HOME && usage != HID_CONSUMER_CLEAR) {
+    return;
+  }
+  if (usage != gPrevConsumer) gLastConsumerEdgeMs = now;
 
   if (usage == HID_CONSUMER_PLAY_PAUSE && gPrevConsumer != HID_CONSUMER_PLAY_PAUSE) {
     onPlayPauseClick();
@@ -397,6 +481,8 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     gDoConnect = false;
     gBootKb = nullptr;
     gInputReports.clear();
+    gKbReportHandle = 0;
+    gConsumerReportHandle = 0;
     clearHeldAxes();
 
     if (gEverReady && !gNeedReconnect) {
@@ -414,6 +500,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
       gReconnectAttempt = 0;
       gReconnectAtMs = millis() + RECONNECT_DELAY_MS;
     }
+    refreshDisplay();
   }
   void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
     Serial.printf("[BLE] auth complete encrypted=%d bonded=%d\n",
@@ -421,20 +508,39 @@ class ClientCallbacks : public NimBLEClientCallbacks {
   }
 };
 
-static uint16_t gLastHidHandle = 0xFFFF;
-static size_t gLastHidLen = 0;
-static uint8_t gLastHidData[16];
+// Per-handle dedupe (kb + consumer can alternate without wiping each other).
+struct HidDedupe {
+  uint16_t handle = 0xFFFF;
+  size_t len = 0;
+  uint8_t data[16];
+};
+static HidDedupe gHidDedup[2];
 
 static bool isDuplicateHidPayload(uint16_t handle, const uint8_t* data, size_t len) {
-  if (len == 0 || len > sizeof(gLastHidData)) return false;
-  if (handle == gLastHidHandle && len == gLastHidLen &&
-      memcmp(data, gLastHidData, len) == 0) {
+  if (len == 0 || len > sizeof(gHidDedup[0].data)) return false;
+  HidDedupe* slot = &gHidDedup[0];
+  if (gHidDedup[0].handle == handle) slot = &gHidDedup[0];
+  else if (gHidDedup[1].handle == handle) slot = &gHidDedup[1];
+  else if (gHidDedup[0].handle == 0xFFFF) slot = &gHidDedup[0];
+  else slot = &gHidDedup[1];
+
+  if (slot->handle == handle && slot->len == len &&
+      memcmp(data, slot->data, len) == 0) {
     return true;
   }
-  gLastHidHandle = handle;
-  gLastHidLen = len;
-  memcpy(gLastHidData, data, len);
+  slot->handle = handle;
+  slot->len = len;
+  memcpy(slot->data, data, len);
   return false;
+}
+
+static bool isKeyboardReportHandle(uint16_t handle) {
+  if (gBootKb && handle == gBootKb->getHandle()) return true;
+  return gKbReportHandle != 0 && handle == gKbReportHandle;
+}
+
+static bool isConsumerReportHandle(uint16_t handle) {
+  return gConsumerReportHandle != 0 && handle == gConsumerReportHandle;
 }
 
 static void handleHidPayload(const char* tag, NimBLERemoteCharacteristic* chr,
@@ -443,29 +549,43 @@ static void handleHidPayload(const char* tag, NimBLERemoteCharacteristic* chr,
   // Identical consecutive reports (notify spam / POLL reread) — skip log + reapply.
   if (isDuplicateHidPayload(handle, data, len)) return;
 
-  Serial.printf("[%s] uuid=%s handle=%u len=%u hex=",
-                tag,
-                chr ? chr->getUUID().toString().c_str() : "?",
-                handle,
-                (unsigned)len);
-  for (size_t i = 0; i < len; i++) Serial.printf("%02X", data[i]);
-  Serial.println();
+  const bool asKb = isKeyboardReportHandle(handle);
+  const bool asCons = isConsumerReportHandle(handle);
+  // Extra Input reports (mouse/vendor/etc.) must not drive axes.
+  if (!asKb && !asCons) {
+    if (HID_VERBOSE) {
+      Serial.printf("[%s] ignore handle=%u len=%u\n", tag, handle, (unsigned)len);
+    }
+    return;
+  }
+
+  if (HID_VERBOSE) {
+    Serial.printf("[%s] uuid=%s handle=%u len=%u hex=",
+                  tag,
+                  chr ? chr->getUUID().toString().c_str() : "?",
+                  handle,
+                  (unsigned)len);
+    for (size_t i = 0; i < len; i++) Serial.printf("%02X", data[i]);
+    Serial.println();
+  }
 
   // Boot keyboard is exactly 8 bytes. Report-protocol keyboard input is often
   // also 8 bytes (modifier, reserved, 6 keys) or 8+ with report id stripped by stack.
   HidBootKeyboardReport report;
-  if (len == 8 && parseBootKeyboardReport(data, len, &report)) {
-    printBootKeyboardReport(report);
+  if (asKb && len == 8 && parseBootKeyboardReport(data, len, &report)) {
+    if (HID_VERBOSE) printBootKeyboardReport(report);
     handlePoseKeys(report);
     if (gTour == TOUR_PLAY || gTour == TOUR_PAUSE) {
       updateHeldAxes(AXIS_KB_MASK, 0);
     } else {
       updateHeldAxes(AXIS_KB_MASK, keyboardAxesMask(report));
     }
-  } else if (len == 9) {
+  } else if (asKb && len == 9) {
     if (parseBootKeyboardReport(data + 1, 8, &report)) {
-      Serial.printf("  reportId=%u\n", data[0]);
-      printBootKeyboardReport(report);
+      if (HID_VERBOSE) {
+        Serial.printf("  reportId=%u\n", data[0]);
+        printBootKeyboardReport(report);
+      }
       handlePoseKeys(report);
       if (gTour == TOUR_PLAY || gTour == TOUR_PAUSE) {
         updateHeldAxes(AXIS_KB_MASK, 0);
@@ -473,8 +593,8 @@ static void handleHidPayload(const char* tag, NimBLERemoteCharacteristic* chr,
         updateHeldAxes(AXIS_KB_MASK, keyboardAxesMask(report));
       }
     }
-  } else if (len == 2) {
-    printConsumerReport(data, len);
+  } else if (asCons && len == 2) {
+    if (HID_VERBOSE) printConsumerReport(data, len);
     uint16_t usage = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
     handleConsumerEdge(usage);
     if (gTour == TOUR_PLAY || gTour == TOUR_PAUSE) {
@@ -482,7 +602,7 @@ static void handleHidPayload(const char* tag, NimBLERemoteCharacteristic* chr,
     } else {
       updateHeldAxes(AXIS_CONSUMER_MASK, consumerAxisMask(usage));
     }
-  } else if (len > 0) {
+  } else if (HID_VERBOSE && len > 0) {
     Serial.println("  (raw report)");
   }
 }
@@ -518,18 +638,18 @@ static bool subscribeChar(NimBLERemoteCharacteristic* ch, const char* label) {
   return false;
 }
 
-static int reportTypeOf(NimBLERemoteCharacteristic* ch) {
+static bool reportRefOf(NimBLERemoteCharacteristic* ch, uint8_t* outId, uint8_t* outType) {
   // Report Reference 0x2908: [reportId, reportType] type 1=Input 2=Output 3=Feature
   NimBLERemoteDescriptor* ref = ch->getDescriptor(UUID_REPORT_REF);
-  if (!ref) return -1;
+  if (!ref) return false;
   std::string v = ref->readValue();
-  if (v.size() < 2) return -1;
-  uint8_t reportId = (uint8_t)v[0];
-  uint8_t reportType = (uint8_t)v[1];
+  if (v.size() < 2) return false;
+  *outId = (uint8_t)v[0];
+  *outType = (uint8_t)v[1];
   Serial.printf("  reportRef id=%u type=%u (%s)\n",
-                reportId, reportType,
-                reportType == 1 ? "Input" : reportType == 2 ? "Output" : reportType == 3 ? "Feature" : "?");
-  return reportType;
+                *outId, *outType,
+                *outType == 1 ? "Input" : *outType == 2 ? "Output" : *outType == 3 ? "Feature" : "?");
+  return true;
 }
 
 static bool subscribeHidReports(NimBLEClient* client);
@@ -538,6 +658,11 @@ static void startScan();
 static void scheduleNextReconnect();
 
 static void scheduleNextReconnect() {
+  // Tour PLAY: never scan/spam — wait for next F1 window.
+  if (gTour == TOUR_PLAY) {
+    gReconnectAtMs = millis() + 60000;
+    return;
+  }
   // Mostly stay on direct connect; short scan every N fails as a fallback.
   if (gReconnectAttempt > 0 && (gReconnectAttempt % SCAN_EVERY_N_FAILS) == 0) {
     Serial.printf("[BLE] %d direct fails - quick %lus scan\n",
@@ -553,6 +678,8 @@ static void scheduleNextReconnect() {
 static bool subscribeHidReports(NimBLEClient* client) {
   gBootKb = nullptr;
   gInputReports.clear();
+  gKbReportHandle = 0;
+  gConsumerReportHandle = 0;
 
   // Fresh discovery after bonding
   client->getServices(true);
@@ -594,15 +721,26 @@ static bool subscribeHidReports(NimBLEClient* client) {
     }
 
     if (uuid == UUID_HID_REPORT) {
-      int rtype = reportTypeOf(ch);
+      uint8_t rid = 0, rtype = 0;
+      bool haveRef = reportRefOf(ch, &rid, &rtype);
       // Subscribe Input reports; if no Report Ref, still try (some cheap boards omit it)
-      if (rtype == 2 || rtype == 3) {
+      if (haveRef && (rtype == 2 || rtype == 3)) {
         Serial.println("  skip Output/Feature report");
         continue;
       }
       if (subscribeChar(ch, "REPORT")) {
         gInputReports.push_back(ch);
         any = true;
+        // Bind control paths: id1=keyboard, id2=consumer (this keyboard's layout)
+        if (haveRef && rtype == 1) {
+          if (rid == 1 && gKbReportHandle == 0) {
+            gKbReportHandle = ch->getHandle();
+            Serial.printf("  -> keyboard report handle=%u\n", gKbReportHandle);
+          } else if (rid == 2 && gConsumerReportHandle == 0) {
+            gConsumerReportHandle = ch->getHandle();
+            Serial.printf("  -> consumer report handle=%u\n", gConsumerReportHandle);
+          }
+        }
       }
       continue;
     }
@@ -634,9 +772,21 @@ static bool subscribeHidReports(NimBLEClient* client) {
     }
   }
 
-  Serial.printf("[HID] subscribed boot=%s inputReports=%u\n",
+  // Fallback if Report Ref ids missing: first subscribed Input is keyboard.
+  if (gKbReportHandle == 0 && !gInputReports.empty()) {
+    gKbReportHandle = gInputReports[0]->getHandle();
+    Serial.printf("[HID] fallback keyboard handle=%u\n", gKbReportHandle);
+  }
+  if (gConsumerReportHandle == 0 && gInputReports.size() >= 2) {
+    gConsumerReportHandle = gInputReports[1]->getHandle();
+    Serial.printf("[HID] fallback consumer handle=%u\n", gConsumerReportHandle);
+  }
+
+  Serial.printf("[HID] subscribed boot=%s inputReports=%u kbH=%u consH=%u\n",
                 gBootKb ? "yes" : "no",
-                (unsigned)gInputReports.size());
+                (unsigned)gInputReports.size(),
+                (unsigned)gKbReportHandle,
+                (unsigned)gConsumerReportHandle);
   return any;
 }
 
@@ -664,7 +814,10 @@ static bool connectToKeyboard() {
 
   gClient = NimBLEDevice::createClient();
   gClient->setClientCallbacks(new ClientCallbacks(), true);
-  gClient->setConnectTimeout(CONNECT_TIMEOUT_S);
+  // Tour F1 window: short timeout so one miss does not stall the arm.
+  const uint32_t connTo = tourPlayBleWindowOpen() ? TOUR_F1_CONNECT_TIMEOUT_S
+                                                   : CONNECT_TIMEOUT_S;
+  gClient->setConnectTimeout(connTo);
 
   bool ok = false;
   // Prefer known MAC first (single-keyboard); scanned target is fallback.
@@ -712,6 +865,7 @@ static bool connectToKeyboard() {
   gLastHeartbeatMs = millis();
   Serial.println("[BLE] ready - press keys now");
   Serial.println("[TIP] If still silent: power-cycle keyboard, keep it awake, retry");
+  refreshDisplay();
   return true;
 }
 
@@ -748,7 +902,7 @@ void setup() {
   Serial.println("========================================");
   Serial.println("1) Put BLE keyboard in pairing mode");
   Serial.println("2) Wait for [SCAN] / connect");
-  Serial.println("3) ESC=hard init | F1-F10 save | 0-9 recall | 0x223=HOME | 0x221=clear | 0xCD=tour | 0x196=stop");
+  Serial.println("3) ESC=reassert+HOME slew | F1-F10 save | 0-9 recall | HOME | clear | tour | WWW stop");
   Serial.println("========================================");
 #ifdef SERVO_SINGLE_PIN
   Serial.printf("SINGLE TEST: signal->GPIO%d | ext VCC + common GND\n", SERVO_SINGLE_PIN);
@@ -764,19 +918,38 @@ void setup() {
                 CSG_SDA_PIN, CSG_SCL_PIN);
   gCsg.begin();
 
-  gServos.begin();
   gMem.begin();
-  // Power/PWM settle, then force fixed HOME twice (physical pose unknown at boot)
+  // First PWM is absolute: start at last pose (if any), then slew to HOME.
+  // Old begin() wrote 90° immediately → looked like "boot still too fast" and slew was a no-op.
   {
+    int start[4];
     int home[4];
     gMem.getHome(home);
-    delay(400);
+    if (gMem.loadLast(start)) {
+      Serial.printf("[MEM] boot restore last %d,%d,%d,%d\n",
+                    start[0], start[1], start[2], start[3]);
+    } else {
+      for (int i = 0; i < 4; i++) start[i] = home[i];
+      Serial.println("[MEM] boot no last pose — start at HOME");
+    }
+    gServos.begin(start);
+    delay(500);  // hold last pose before moving
+
+    const int bootLevel = 5;
+    const int savedLevel = getSpeedLevel();
+    setSpeedLevel(bootLevel);
+    gServos.gotoAngles(home);
+    Serial.printf("[MEM] boot HOME slew -> %d,%d,%d,%d (speed %d)\n",
+                  home[0], home[1], home[2], home[3], getSpeedLevel());
+    const uint32_t t0 = millis();
+    while (gServos.busy() && (millis() - t0) < 20000) {
+      gServos.service();
+      delay(10);
+    }
     gServos.setAnglesImmediate(home);
-    Serial.printf("[MEM] boot HOME -> %d,%d,%d,%d\n",
-                  home[0], home[1], home[2], home[3]);
-    delay(500);
-    gServos.setAnglesImmediate(home);
-    Serial.println("[MEM] boot HOME reinforced");
+    gMem.saveLast(home);
+    setSpeedLevel(savedLevel);
+    Serial.println("[MEM] boot HOME done");
   }
   gTourSlot = 0;
   refreshDisplay();
@@ -798,21 +971,41 @@ void setup() {
 void loop() {
   NimBLEScan* scan = NimBLEDevice::getScan();
 
-  // Direct reconnect to preferred/last MAC (single-keyboard fast path)
+  // Direct reconnect to preferred/last MAC (single-keyboard fast path).
+  // Tour PLAY: only inside F1's 2s window (avoids blocking the motion loop).
   if (gNeedReconnect && !gConnected && (int32_t)(millis() - gReconnectAtMs) >= 0) {
-    gReconnectAttempt++;
-    Serial.printf("[BLE] reconnect attempt %d\n", gReconnectAttempt);
-    if (connectToKeyboard()) {
-      Serial.printf("[BLE] reconnect OK (attempt %d)\n", gReconnectAttempt);
+    if (!bleReconnectAllowedNow()) {
+      // Defer until F1 window or tour leaves PLAY; keep flag for later.
+      gReconnectAtMs = millis() + 500;
     } else {
-      Serial.printf("[BLE] reconnect attempt %d failed\n", gReconnectAttempt);
-      scheduleNextReconnect();
+      gReconnectAttempt++;
+      Serial.printf("[BLE] reconnect attempt %d%s\n", gReconnectAttempt,
+                    tourPlayBleWindowOpen() ? " (tour F1)" : "");
+      if (connectToKeyboard()) {
+        Serial.printf("[BLE] reconnect OK (attempt %d)\n", gReconnectAttempt);
+        gTourBleUntilMs = 0;
+      } else {
+        Serial.printf("[BLE] reconnect attempt %d failed\n", gReconnectAttempt);
+        if (gTour == TOUR_PLAY) {
+          // One short try per F1; do not schedule scan/spam inside tour.
+          if (!tourPlayBleWindowOpen()) {
+            gReconnectAtMs = millis() + 60000;  // wait next F1
+          } else {
+            gReconnectAtMs = millis() + 200;  // maybe one more inside window
+          }
+        } else {
+          scheduleNextReconnect();
+        }
+      }
     }
   }
 
   if (!gConnected && !gDoConnect && !gNeedReconnect && gLastScanMs != 0 &&
       !scan->isScanning() && (millis() - gLastScanMs > 100)) {
-    if (gTarget) {
+    if (gTour == TOUR_PLAY && !tourPlayBleWindowOpen()) {
+      // Ignore scan completion during tour outside F1 window.
+      gLastScanMs = 0;
+    } else if (gTarget) {
       Serial.printf("[SCAN] selected: %s (%s)\n",
                     gTarget->getName().c_str(),
                     gTarget->getAddress().toString().c_str());
@@ -827,16 +1020,22 @@ void loop() {
   }
 
   if (gDoConnect && !gConnected && !gNeedReconnect) {
-    gDoConnect = false;
-    if (!connectToKeyboard()) {
-      seedPreferredAddr();
-      gNeedReconnect = true;
-      gReconnectAttempt = 0;
-      gReconnectAtMs = millis() + RECONNECT_RETRY_MS;
+    if (gTour == TOUR_PLAY && !tourPlayBleWindowOpen()) {
+      gDoConnect = false;
+    } else {
+      gDoConnect = false;
+      if (!connectToKeyboard()) {
+        seedPreferredAddr();
+        gNeedReconnect = true;
+        gReconnectAttempt = 0;
+        gReconnectAtMs = millis() + RECONNECT_RETRY_MS;
+      }
     }
   }
 
-  // Heartbeat + optional poll (some clones never notify, only readable)
+  // Heartbeat log only — GATT POLL here blocked the servo loop and could
+  // clear held keys (read as key-up) while the user was still holding.
+  static bool gWasBusy = false;
   if (gConnected && gClient && gClient->isConnected()) {
     serviceHeldInputs();
 
@@ -845,29 +1044,33 @@ void loop() {
       Serial.printf("[HB] connected, waiting for key notifies (boot=%s reports=%u)\n",
                     gBootKb ? "yes" : "no",
                     (unsigned)gInputReports.size());
-
-      // Poll readable reports — some clones update value without notify
-      if (gBootKb && gBootKb->canRead()) {
-        std::string v = gBootKb->readValue();
-        if (v.size() > 0) {
-          handleHidPayload("POLL", gBootKb, (uint8_t*)v.data(), v.size());
-        }
-      }
-      for (size_t i = 0; i < gInputReports.size() && i < 3; i++) {
-        auto* ch = gInputReports[i];
-        if (ch && ch->canRead()) {
-          std::string v = ch->readValue();
-          if (v.size() > 0) {
-            handleHidPayload("POLL", ch, (uint8_t*)v.data(), v.size());
-          }
-        }
-      }
     }
   } else {
     // Keep ramping to recall/tour targets even while BLE is down.
     if (gHeldAxes) clearHeldAxes();
     gServos.service();
     serviceTour();
+  }
+  // Remember pose when motion settles (used for gentle next boot)
+  {
+    const bool busy = gServos.busy();
+    if (gWasBusy && !busy) {
+      int deg[4];
+      gServos.getAngles(deg);
+      gMem.saveLast(deg);
+    }
+    gWasBusy = busy;
+  }
+
+  // Live-update axis pages while moving; status blinks LOSt when BLE down
+  if (gCsg.ok()) {
+    const uint32_t period =
+        (!gConnected && gDispPage == DISP_STATUS) ? 250 : DISP_ANGLE_REFRESH_MS;
+    if ((gDispPage != DISP_STATUS || !gConnected) &&
+        (millis() - gLastDispMs >= period)) {
+      gLastDispMs = millis();
+      refreshDisplay();
+    }
   }
 
   delay(20);
